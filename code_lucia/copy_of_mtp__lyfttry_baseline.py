@@ -64,8 +64,8 @@ import pytorch_lightning as pl
 DIR_INPUT = 'lyft-motion-prediction-autonomous-vehicles/'
 SINGLE_MODE_SUBMISSION = f"{DIR_INPUT}/single_mode_sample_submission.csv"
 MULTI_MODE_SUBMISSION = f"{DIR_INPUT}/multi_mode_sample_submission.csv"
-CPUnum= 18
-GPUnum = 4
+CPUnum= 80
+GPUnum = 1
 resul_dir = '/home/zeta/Desktop/Lucia/l5kit/results' #LUCIA
 
 DEBUG = False
@@ -88,7 +88,7 @@ cfg = {
     },
     
     'raster_params': {
-        'raster_size': [350, 350],
+        'raster_size': [300, 300],
         'pixel_size': [0.5, 0.5],
         'ego_center': [0.25, 0.5],
         'map_type': 'py_semantic',
@@ -100,14 +100,14 @@ cfg = {
     
     'train_data_loader': {
         'key': 'scenes/train.zarr',
-        'batch_size': 16,
+        'batch_size': 32,
         'shuffle': True,
         'num_workers': CPUnum #8
     },
     
      'valid_data_loader': {
         'key': 'scenes/validate.zarr',
-        'batch_size': 16,
+        'batch_size': 32,
         'shuffle': False,
         'num_workers': CPUnum # 8
     },
@@ -132,8 +132,6 @@ cfg = {
 os.environ["L5KIT_DATA_FOLDER"] = DIR_INPUT
 dm = LocalDataManager(None)
 
-
-os.environ["L5KIT_DATA_FOLDER"] = DIR_INPUT
 
 # --- Function utils ---
 # Original code from https://github.com/lyft/l5kit/blob/20ab033c01610d711c3d36e1963ecec86e8b85b6/l5kit/l5kit/evaluation/metrics.py
@@ -180,6 +178,7 @@ def pytorch_neg_multi_log_likelihood_batch(
 
     # error (batch_size, num_modes, future_len)
     error = torch.sum(((gt - pred) * avails) ** 2, dim=-1)  # reduce coords and use availability
+    error = error/4
 
     with np.errstate(divide="ignore"):  # when confidence is 0 log goes to -inf, but we're fine with it
         # error (batch_size, num_modes)
@@ -211,6 +210,78 @@ def pytorch_neg_multi_log_likelihood_single(
     confidences = pred.new_ones((batch_size, 1))
     return pytorch_neg_multi_log_likelihood_batch(gt, pred.unsqueeze(1), confidences, avails)
 
+
+def targets_world_to_image(targets,matrix,centroid,device):
+    rs = cfg["raster_params"]["raster_size"]
+    ec = cfg["raster_params"]["ego_center"]
+
+    bs,tl,_ = targets.shape
+    targets = targets + centroid
+    targets = torch.cat([targets,torch.ones((bs,tl,1)).to(device)], dim=2)
+    targets = torch.matmul(matrix.to(torch.float), targets.transpose(1,2))
+    targets = targets.transpose(1,2)[:,:,:2]
+    bias = torch.tensor([rs[0] * ec[0], rs[1] * ec[1]])[None, None, :].to(device)
+    targets = targets - bias
+    return targets
+
+
+def targets_image_to_world(pred,matrix,centroid,device):
+    rs = cfg["raster_params"]["raster_size"]
+    ec = cfg["raster_params"]["ego_center"]
+
+    bias = torch.tensor([rs[0] * ec[0], rs[1] * ec[1]])[None, None, :].to(device)
+    bs,cf,tl,_ = pred.shape
+    matrix_inv = torch.inverse(matrix)
+    pred = pred + bias[:,None,:,:]
+    pred = torch.cat([pred,torch.ones((bs,3,tl,1)).to(device)], dim=3)
+    pred = torch.stack([torch.matmul(matrix_inv.to(torch.float), pred[:,i].transpose(1,2)) 
+                            for i in range(3)], dim=1)
+    pred = pred.transpose(2,3)[:,:,:,:2]
+    pred = pred - centroid[:,None,:,:]
+    return pred
+
+
+class CheckpointEveryNSteps(pl.Callback):
+    """
+    Save a checkpoint every N steps, instead of Lightning's default that checkpoints
+    based on validation loss.
+    """
+
+    def __init__(
+        self,
+        save_step_frequency,
+        checkpoint_result_dir ='./',
+        prefix="N-Step-Checkpoint",
+        use_modelcheckpoint_filename=False,
+    ):
+        """
+        Args:
+            save_step_frequency: how often to save in steps
+            prefix: add a prefix to the name, only used if
+                use_modelcheckpoint_filename=False
+            use_modelcheckpoint_filename: just use the ModelCheckpoint callback's
+                default filename, don't use ours.
+        """
+        self.save_step_frequency = save_step_frequency
+        self.prefix = prefix
+        self.use_modelcheckpoint_filename = use_modelcheckpoint_filename
+        self.checkpoint_result_dir = checkpoint_result_dir 
+
+    def on_batch_end(self, trainer: pl.Trainer, _):
+        """ Check if we should save a checkpoint after every train batch """
+        # epoch = trainer.current_epoch
+        global_step = trainer.global_step
+        if global_step % self.save_step_frequency == 0:
+            if self.use_modelcheckpoint_filename:
+                filename = trainer.checkpoint_callback.filename
+            else:
+                filename = f"{self.prefix}_{global_step}.ckpt"
+            ckpt_path = os.path.join(self.checkpoint_result_dir, filename)
+            trainer.save_checkpoint(ckpt_path)
+
+
+
+            
 class MyDataset(object):
     def __init__(self):
         super().__init__()
@@ -231,12 +302,13 @@ class MyDataset(object):
         key = "valid_data_loader"
         dl_cfg = self.cfg[key]
         zarr_dataset = self.chunked_dataset(key)
-        agent_dataset = AgentDataset(self.cfg, zarr_dataset, self.rast)
+        agent_dataset = AgentDataset(self.cfg, zarr_dataset, self.rast,min_frame_future=10)
         return DataLoader(
             agent_dataset,
             shuffle=dl_cfg["shuffle"],
             batch_size=dl_cfg["batch_size"],
             num_workers=dl_cfg["num_workers"],
+            pin_memory=True,
         )
 
     @property
@@ -253,6 +325,7 @@ class MyDataset(object):
             shuffle=dl_cfg["shuffle"],
             batch_size=dl_cfg["batch_size"],
             num_workers=dl_cfg["num_workers"],
+            pin_memory=True,
         )
 
     @property
@@ -260,12 +333,13 @@ class MyDataset(object):
         key = "train_data_loader"
         dl_cfg = self.cfg[key]
         zarr_dataset = self.chunked_dataset(key)
-        agent_dataset = AgentDataset(self.cfg, zarr_dataset, self.rast)
+        agent_dataset = AgentDataset(self.cfg, zarr_dataset, self.rast,min_frame_future=10)
         return DataLoader(
             agent_dataset,
             shuffle=dl_cfg["shuffle"],
             batch_size=dl_cfg["batch_size"],
             num_workers=dl_cfg["num_workers"],
+            pin_memory=True,
         )
     '''
     def plt_show_agent_map(self, idx):
@@ -282,6 +356,7 @@ class MyDataset(object):
         plt.show()
     '''
 
+avg_tr_loss=[]
 class LyftModel(pl.LightningModule):
     """Model is resnet101_02 pretrained on imagenet.
     We must replace the input and the final layer to address Lyft requirements.
@@ -358,15 +433,21 @@ class LyftModel(pl.LightningModule):
             batch["target_availabilities"], device=self.device
         )
         targets = torch.tensor(batch["target_positions"], device=self.device)
+        matrix = batch["world_to_image"].to(self.device)
+        centroid = batch["centroid"].to(self.device)[:,None,:].to(torch.float)
+
         data = torch.tensor(batch["image"], device=self.device)
-        meta=torch.cat(
-            (batch['extent'],torch.flatten(batch['history_yaws'].float(), 1)
+        meta=torch.cat((batch['extent']
+                    ,torch.flatten(batch['history_yaws'].float(), 1)
                     ,batch['history_positions'][:,:,0].float(),batch['history_positions'][:,:,1].float()), dim=1).to(self.device)
+
+
         outputs,confidence = self(data,meta)
+        targets=targets_world_to_image(targets,matrix,centroid,self.device)
         loss = pytorch_neg_multi_log_likelihood_batch(targets, outputs, confidence, target_availabilities)
-        result = pl.TrainResult(loss)
-        result.log("train_loss", loss, on_step=True)
-        return result
+        avg_tr_loss.append(loss.item())
+        pbar ={'avg_train_loss':np.mean(avg_tr_loss)}
+        return {'loss':loss, 'progress_bar':pbar}
 
     # def validation_step(self, batch, batch_idx):
     #     target_availabilities = torch.tensor(
@@ -386,21 +467,24 @@ class LyftModel(pl.LightningModule):
         return optim.Adam(self.parameters(), lr=1e-3)
 
 
-def train_model(my_dataset, gpus=0, pretrained=True):
+def train_model(my_dataset,checkpoint_callback, gpus=0, pretrained=True):
     model = LyftModel(my_dataset.cfg, pretrained=pretrained)
     train_dl = my_dataset.train_data_loader
     val_dl = my_dataset.val_data_loader
-    trainer = pl.Trainer(gpus=gpus, max_steps=500, min_epochs=3, max_epochs=10,default_root_dir=resul_dir,distributed_backend="ddp")
+    trainer = pl.Trainer(gpus=gpus,max_steps=160000,precision=16,callbacks=[checkpoint_callback],distributed_backend="ddp")
+    
+    #use trainer below if resuming from previous checkpoint
+    #trainer = pl.Trainer(gpus=gpus,max_steps=200,precision=16,resume_from_checkpoint='/content/drive/My Drive/Lyft L5 Motion Prediction/lightning_checkpoints/N-Step-Checkpoint_150.ckpt',callbacks=[checkpoint_callback],distributed_backend="ddp")
+    
     #trainer.fit(model, train_dl, val_dl) #LUCIA
     trainer.fit(model, train_dl)
     return model
 
 my_dataset = MyDataset()
+checkpoint_callback=CheckpointEveryNSteps(40000) #pass number of steps to save model checkpoint after and directory for saving the checkpoint(by default current directory)
 
-#model = train_model(my_dataset, gpus=1)
-
-model = train_model(my_dataset, gpus=GPUnum)
-
+model = train_model(my_dataset,checkpoint_callback, gpus=GPUnum)
+torch.save(model.state_dict(),'epoch_end.pth' ) # replace the path to save the final model.
 
 
 
